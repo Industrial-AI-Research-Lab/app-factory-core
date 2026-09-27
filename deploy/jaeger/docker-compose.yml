@@ -1,0 +1,66 @@
+# Jaeger (all-in-one) for the inner-cluster (node20) lab stand — owned by deploy-jaeger-inner.yml.
+#
+# Distinct from .github/workflows/deploy-jaeger.yml, which deploys Jaeger to the EXTERNAL K3s
+# cluster (kubectl + Authelia ingress on a public FQDN). This is the local stand: one all-in-one
+# container attached to the lab-local `AppFactory-lab_internal` network, so the backend containers
+# reach it at http://jaeger:4318/v1/traces (OTLP HTTP — see src/telemetry/tracer.py). A separate
+# Caddy gateway exposes only authenticated POST /v1/traces on the host; Jaeger's own OTLP port
+# remains private. The UI bind is configured independently and must stay on the LAN or loopback.
+#
+# Storage is in-memory, bounded by MEMORY_MAX_TRACES: right for a lab where only recent traces
+# matter, but traces are lost on restart. All ${VARS} are supplied by the workflow with defaults.
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:${JAEGER_VERSION:-1.76.0}
+    container_name: AppFactory-lab-jaeger
+    restart: unless-stopped
+    environment:
+      # Turn on the OTLP receivers (gRPC 4317, HTTP 4318); off by default in all-in-one v1.
+      COLLECTOR_OTLP_ENABLED: "true"
+      # Bound the in-memory store so a long-lived lab can't grow the collector without limit.
+      MEMORY_MAX_TRACES: "${JAEGER_MEMORY_MAX_TRACES:-50000}"
+    ports:
+      # The UI uses its own trusted bind. Jaeger's OTLP ports stay off the host so clients cannot
+      # bypass the authenticated gateway below.
+      - "${JAEGER_UI_BIND:-127.0.0.1}:${JAEGER_UI_PORT:-16686}:16686"
+    networks:
+      - internal
+    mem_limit: ${JAEGER_MEM_LIMIT:-1g}
+    cpus: ${JAEGER_CPUS:-1}
+
+  otlp-gateway:
+    image: caddy:${CADDY_VERSION:-2.11.3-alpine}
+    container_name: AppFactory-lab-jaeger-otlp-gateway
+    restart: unless-stopped
+    depends_on:
+      - jaeger
+    ports:
+      - "${JAEGER_OTLP_BIND:-127.0.0.1}:${JAEGER_OTLP_PORT:-4318}:4318"
+    environment:
+      # Caddy receives only the bcrypt hash. The plaintext password remains a GitHub Secret and
+      # is used by the deploy workflow solely for the authenticated acceptance smoke.
+      JAEGER_OTLP_USERNAME: "${JAEGER_OTLP_USERNAME:?set JAEGER_OTLP_USERNAME}"
+      JAEGER_OTLP_PASSWORD_HASH: "${JAEGER_OTLP_PASSWORD_HASH:?set JAEGER_OTLP_PASSWORD_HASH}"
+    volumes:
+      # The node20 runner is a sibling container, so the workflow stages this file into a named
+      # volume with docker cp instead of relying on a checkout bind mount the host daemon cannot see.
+      - jaeger-caddy-config:/etc/caddy:ro
+    networks:
+      - internal
+    mem_limit: ${JAEGER_OTLP_GATEWAY_MEM_LIMIT:-128m}
+    cpus: ${JAEGER_OTLP_GATEWAY_CPUS:-0.25}
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  jaeger-caddy-config:
+    name: jaeger-caddy-config
+    external: true
+
+# Created and owned by the lab-local `AppFactory-lab` compose project; we only attach so the backend
+# resolves `jaeger` on the same network. `docker network inspect AppFactory-lab_internal` must exist.
+networks:
+  internal:
+    external: true
+    name: AppFactory-lab_internal

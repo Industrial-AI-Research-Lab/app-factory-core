@@ -1,0 +1,6 @@
+apiVersion: v2
+name: AppFactory
+version: 0.1.0
+description: AppFactory app (frontend + backend) with TLS Ingress for AppFactory.example.com and api.AppFactory.example.com
+kubeVersion: ">=1.24.0"
+type: application

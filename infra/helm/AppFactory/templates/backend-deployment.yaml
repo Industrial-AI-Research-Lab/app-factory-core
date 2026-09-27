@@ -1,0 +1,195 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "AppFactory.fullname" . }}-backend
+  labels:
+    app.kubernetes.io/name: AppFactory-backend
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: {{ .Values.backend.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: AppFactory-backend
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: AppFactory-backend
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      imagePullSecrets:
+{{- range .Values.imagePullSecrets }}
+        - name: {{ .name }}
+{{- end }}
+      containers:
+        - name: backend
+          image: "{{ .Values.imageRegistry }}/{{ .Values.imageNamespace }}/{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          imagePullPolicy: {{ .Values.backend.image.pullPolicy }}
+          ports:
+            - containerPort: 8000
+          env:
+{{- range .Values.backend.extraEnv }}
+            - name: {{ .name | quote }}
+              value: {{ .value | quote }}
+{{- end }}
+{{- if .Values.backend.containerUse.enabled }}
+            - name: CONTAINER_USE_CLI_PATH
+              value: {{ .Values.backend.containerUse.cliPath | quote }}
+            - name: DOCKER_HOST
+              value: {{ .Values.backend.containerUse.dockerHost | quote }}
+{{- end }}
+{{- if .Values.backend.gitConfig.enabled }}
+            - name: GIT_USER_EMAIL
+              value: {{ .Values.backend.gitConfig.email | quote }}
+            - name: GIT_USER_NAME
+              value: {{ .Values.backend.gitConfig.name | quote }}
+{{- end }}
+          envFrom:
+{{- range .Values.backend.extraEnvFromSecrets }}
+            - secretRef:
+                name: {{ . | quote }}
+{{- end }}
+{{- if .Values.backend.gitConfig.enabled }}
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    set -e
+                    git config --global user.email "${GIT_USER_EMAIL:-ci@cu}"
+                    git config --global user.name "${GIT_USER_NAME:-CI}"
+{{- end }}
+          resources: {{ toYaml .Values.backend.resources | nindent 12 }}
+          volumeMounts:
+{{- if .Values.backend.containerUse.enabled }}
+            - name: cu-bin
+              mountPath: /opt/cu
+{{- end }}
+{{- if .Values.backend.dind.registrySecretName }}
+            - name: docker-config
+              mountPath: /root/.docker
+{{- end }}
+{{- if .Values.backend.dind.enabled }}
+        - name: dind
+          image: {{ .Values.backend.dind.image | quote }}
+          securityContext:
+            privileged: {{ .Values.backend.dind.privileged }}
+{{- if .Values.backend.dind.env }}
+          env:
+{{- range $k, $v := .Values.backend.dind.env }}
+            - name: {{ $k | quote }}
+              value: {{ $v | quote }}
+{{- end }}
+{{- end }}
+{{- if .Values.backend.dind.args }}
+          args:
+{{- range .Values.backend.dind.args }}
+            - {{ . | quote }}
+{{- end }}
+{{- end }}
+          ports:
+            - containerPort: 2375
+              name: docker
+          volumeMounts:
+            - name: dind-storage
+              mountPath: /var/lib/docker
+{{- end }}
+
+      initContainers:
+{{- if .Values.backend.dind.registrySecretName }}
+        - name: init-docker-config
+          image: "{{ .Values.imageRegistry }}/{{ .Values.imageNamespace }}/{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /docker-config
+              cp /docker-auth/.dockerconfigjson /docker-config/config.json
+              chmod 600 /docker-config/config.json
+          volumeMounts:
+            - name: docker-config
+              mountPath: /docker-config
+            - name: docker-registry-auth
+              mountPath: /docker-auth/.dockerconfigjson
+              subPath: .dockerconfigjson
+              readOnly: true
+{{- end }}
+{{- if and .Values.backend.containerUse.enabled .Values.backend.containerUse.installCu }}
+        - name: install-cu
+          image: "{{ .Values.imageRegistry }}/{{ .Values.imageNamespace }}/{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          command: ["/bin/sh","-c"]
+          args:
+            - |
+              set -eu
+              # Idempotent: skip if already present in shared volume
+              if [ -x /opt/cu/cu ]; then
+                echo "cu already present at /opt/cu/cu; skipping install"
+                exit 0
+              fi
+              # Try to copy baked-in cu from backend image PATH first (no network)
+              if command -v cu >/dev/null 2>&1; then
+                cp "$(command -v cu)" /opt/cu/cu && chmod +x /opt/cu/cu && exit 0
+              fi
+              # Fallback: attempt network installer with retries/mirror
+              INSTALL_URL="{{ .Values.backend.containerUse.cuInstallScriptUrl }}"
+              {{- if .Values.backend.containerUse.cuMirrorUrl }}
+              MIRROR_URL="{{ .Values.backend.containerUse.cuMirrorUrl }}"
+              {{- end }}
+              i=0; max={{ default 5 .Values.backend.containerUse.installRetries }}; delay={{ default 3 .Values.backend.containerUse.installRetryDelaySeconds }}
+              success=0
+              while [ $i -lt $max ]; do
+                echo "Attempt $((i+1))/$max: installing cu from $INSTALL_URL"
+                if curl -fsSL "$INSTALL_URL" | bash; then success=1; break; fi
+                {{- if .Values.backend.containerUse.cuMirrorUrl }}
+                echo "Primary failed; trying mirror $MIRROR_URL"
+                if curl -fsSL "$MIRROR_URL" | bash; then success=1; break; fi
+                {{- end }}
+                i=$((i+1)); echo "Retrying in ${delay}s..."; sleep $delay
+              done
+              if [ "$success" != "1" ] && ! command -v cu >/dev/null 2>&1 && [ ! -x /root/.local/bin/cu ]; then
+                echo "cu install failed" >&2; exit 1
+              fi
+              SRC="$(command -v cu || echo /root/.local/bin/cu)"
+              if [ -x "$SRC" ]; then
+                cp "$SRC" /opt/cu/cu
+                chmod +x /opt/cu/cu
+              else
+                echo "cu binary not found after install attempts" >&2; exit 1
+              fi
+          volumeMounts:
+            - name: cu-bin
+              mountPath: /opt/cu
+{{- end }}
+
+      volumes:
+{{- if .Values.backend.dind.enabled }}
+        - name: dind-storage
+          emptyDir: {}
+{{- end }}
+{{- if .Values.backend.dind.registrySecretName }}
+        - name: docker-config
+          emptyDir: {}
+        - name: docker-registry-auth
+          secret:
+            secretName: {{ .Values.backend.dind.registrySecretName | quote }}
+{{- end }}
+{{- if .Values.backend.containerUse.enabled }}
+        - name: cu-bin
+          emptyDir: {}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "AppFactory.fullname" . }}-backend
+spec:
+  type: {{ .Values.backend.service.type }}
+  selector:
+    app.kubernetes.io/name: AppFactory-backend
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.backend.service.port }}
+      targetPort: 8000

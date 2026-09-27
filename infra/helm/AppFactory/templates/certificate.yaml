@@ -1,0 +1,32 @@
+{{- if and .Values.ingress.enabled .Values.ingress.certManager.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "AppFactory.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: {{ .Values.ingress.tls.secretName | quote }}
+  issuerRef:
+    kind: ClusterIssuer
+    name: {{ .Values.ingress.certManager.clusterIssuer | quote }}
+  dnsNames:
+    {{- if .Values.ingress.certManager.wildcardDomain }}
+    # Wildcard covers all subdomains (registry, jaeger, llm, api, etc.)
+    - {{ printf "*.%s" .Values.ingress.certManager.wildcardDomain | quote }}
+    - {{ .Values.ingress.certManager.wildcardDomain | quote }}
+    {{- else }}
+    {{- if .Values.ingress.hosts.web }}
+    - {{ .Values.ingress.hosts.web | quote }}
+    {{- end }}
+    {{- if .Values.ingress.hosts.api }}
+    - {{ .Values.ingress.hosts.api | quote }}
+    {{- end }}
+    {{- range .Values.ingress.certManager.extraDnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+    {{- end }}
+  # Renew 30 days before expiry (default is 30 days)
+  renewBefore: 720h
+  privateKey:
+    rotationPolicy: Always
+{{- end }}

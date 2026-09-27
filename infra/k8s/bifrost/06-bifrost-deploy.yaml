@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bifrost
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bifrost
+  template:
+    metadata:
+      labels:
+        app: bifrost
+    spec:
+      containers:
+        - name: bifrost
+          image: maximhq/bifrost:${BIFROST_TAG}
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: BIFROST_ALLOWED_ORIGINS
+              value: "${BIFROST_ALLOWED_ORIGINS}"
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: bifrost-data
+              mountPath: /app/data
+      volumes:
+        - name: bifrost-data
+          persistentVolumeClaim:
+            claimName: bifrost-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bifrost
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: bifrost
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

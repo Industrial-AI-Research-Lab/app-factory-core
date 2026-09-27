@@ -1,0 +1,106 @@
+# Observability (Loki + Promtail + Grafana) for the inner-cluster (node20) lab stand —
+# owned by deploy-observability.yml (self-hosted node20 runner).
+#
+# Replaces the three observability services that currently live only in the unversioned lab-local
+# `AppFactory-lab` compose (grafana/loki/promtail). Same images, same configs, same published ports,
+# so the stand behaves identically — only now the config is in git and redeployable.
+#
+# Log delivery path (unchanged): every container writes stdout -> docker json-file log; promtail
+# discovers containers over the docker socket and tails those files, then pushes to loki; grafana
+# reads loki as its datasource. Backends never talk to loki directly — moving these services here
+# does not change what gets scraped (promtail relabels by each *scraped* container's compose
+# project, so the `compose_project="AppFactory-lab"` dashboard filter still matches backend logs).
+#
+# The three keep their service names (loki/promtail/grafana) so intra-stack DNS keeps resolving,
+# and attach to the shared external `AppFactory-lab_internal` network like the other deploy/ services.
+
+services:
+  loki:
+    image: grafana/loki:${LOKI_VERSION:-2.9.8}
+    container_name: AppFactory-lab-loki
+    restart: unless-stopped
+    # Stock in-image config (/etc/loki/local-config.yaml) — the live stand mounts no loki config,
+    # so pinning the image reproduces it exactly. Vendoring a copy would only invite drift.
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "${LOKI_BIND:-127.0.0.1}:${LOKI_PORT:-3100}:3100"
+    volumes:
+      - loki-data:/loki
+    networks:
+      - internal
+    mem_limit: ${LOKI_MEM_LIMIT:-1g}
+    cpus: ${LOKI_CPUS:-1}
+
+  promtail:
+    image: grafana/promtail:${PROMTAIL_VERSION:-2.9.8}
+    container_name: AppFactory-lab-promtail
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    volumes:
+      # Config lives in a named volume that the deploy workflow fills with `docker cp`, NOT a bind
+      # mount of the checkout: the self-hosted runner is a sibling container with no shared _work, so
+      # the host daemon can't see our files — a bind mount silently becomes an empty dir and this
+      # file-mount dies with "directory onto file". See deploy/observability/README.md.
+      - obs-promtail-config:/etc/promtail:ro
+      # Read-only host log files + the socket promtail uses to discover containers.
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Scrape offsets, so a restart resumes instead of re-reading every log from the top.
+      - promtail-positions:/run/promtail
+    networks:
+      - internal
+    mem_limit: ${PROMTAIL_MEM_LIMIT:-512m}
+    cpus: ${PROMTAIL_CPUS:-0.5}
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-11.2.0}
+    container_name: AppFactory-lab-grafana
+    restart: unless-stopped
+    depends_on:
+      - loki
+    ports:
+      # Live stand publishes on the node LAN IP (GRAFANA_BIND=10.0.15.21), not loopback, so the
+      # Grafana MCP and browsers on the cluster net can reach it. Default here is the safe 127.0.0.1;
+      # set GRAFANA_BIND to the node IP to preserve external access (see README).
+      - "${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set the GRAFANA_ADMIN_PASSWORD secret}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # Must match how Grafana is actually reached or share/deeplink URLs come out wrong.
+      GF_SERVER_ROOT_URL: ${GRAFANA_ROOT_URL:-http://localhost:3000}
+    volumes:
+      - grafana-data:/var/lib/grafana
+      # Staged into a named volume by the deploy workflow (docker cp), not bind-mounted — same
+      # sibling-runner reason as the promtail note above.
+      - obs-grafana-provisioning:/etc/grafana/provisioning:ro
+    networks:
+      - internal
+    mem_limit: ${GRAFANA_MEM_LIMIT:-512m}
+    cpus: ${GRAFANA_CPUS:-0.5}
+
+volumes:
+  loki-data:
+  # Reuse the stand's pre-existing Grafana state volume instead of a fresh, project-prefixed one.
+  # Grafana's DB holds state provisioning can't recreate — service-account tokens (the grafana MCP
+  # authenticates with one), users, preferences — and a fresh DB silently invalidates all of it.
+  # The workflow `docker volume create`s this name first, so a brand-new node still bootstraps.
+  grafana-data:
+    name: AppFactory-lab_grafana-data
+    external: true
+  promtail-positions:
+  # Populated by the deploy workflow before `compose up` (docker volume create + docker cp). External
+  # so the name is stable (not project-prefixed) and the staging step can target it by that name.
+  obs-promtail-config:
+    external: true
+  obs-grafana-provisioning:
+    external: true
+
+# Created and owned by the lab-local `AppFactory-lab` compose project; we only attach so loki/grafana
+# stay reachable by name across the stand. `docker network inspect AppFactory-lab_internal` must exist.
+networks:
+  internal:
+    external: true
+    name: AppFactory-lab_internal

@@ -1,0 +1,167 @@
+# MongoDB (in-cluster, TLS) — per-environment. Reconstructed from live prod 2026-07-20.
+#
+# Referenced by infra/ADD-ENVIRONMENT.md ("Deploy + PVC — см. infra/k8s/mongodb/mongodb.yaml").
+# This file owns the PVC + Deployment only. Provisioned SEPARATELY, per environment:
+#   - Service (NodePort 30017)   -> inlined in ADD-ENVIRONMENT.md
+#   - Certificate `mongo-tls`    -> cert-manager, with that env's own dnsName (mongo[.<env>].AppFactory.example.com)
+#   - Secret `mongodb-creds`     -> created by the env installer (username/password)
+#
+# TLS self-heal (why the cert-reloader sidecar exists):
+#   mongod reads its cert ONCE at boot from /tls/mongo.pem, which the build-pem initContainer
+#   concatenates from the mongo-tls secret. cert-manager rotates that secret ~30 days before
+#   expiry, but nothing tells the running mongod — so without intervention it keeps serving the
+#   OLD cert until it expires and every TLS client (backend login first) breaks. The cert-reloader
+#   sidecar watches the mounted secret, rebuilds the PEM on change, and runs rotateCertificates
+#   online so mongod picks up the new cert with no restart. See the Grafana served-cert alert
+#   (infra/alloy/deploy-alloy.sh) for the backstop if this ever fails.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongodb-data
+  namespace: mongodb
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb
+  namespace: mongodb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  strategy:
+    # Recreate (not RollingUpdate): a single RWO PVC can't be mounted by two pods at once.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      initContainers:
+      - name: build-pem
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          set -e
+          cat /certs/tls.key /certs/tls.crt > /tls/mongo.pem
+          chmod 644 /tls/mongo.pem
+        volumeMounts:
+        - name: cert
+          mountPath: /certs
+          readOnly: true
+        - name: tls
+          mountPath: /tls
+      containers:
+      - name: mongodb
+        image: mongo:7.0
+        args:
+        - --tlsMode=requireTLS
+        - --tlsCertificateKeyFile=/tls/mongo.pem
+        - --tlsCAFile=/etc/ssl/certs/ca-certificates.crt
+        - --tlsAllowConnectionsWithoutCertificates
+        - --bind_ip_all
+        env:
+        - name: MONGO_INITDB_ROOT_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-creds
+              key: username
+        - name: MONGO_INITDB_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-creds
+              key: password
+        - name: MONGO_INITDB_DATABASE
+          value: synaps
+        ports:
+        - containerPort: 27017
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+        volumeMounts:
+        - name: data
+          mountPath: /data/db
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+      # Zero-downtime TLS self-heal on cert-manager rotation (see file header for the why).
+      - name: cert-reloader
+        image: mongo:7.0
+        command:
+        - /bin/bash
+        - -c
+        args:
+        - |
+          set -u
+          LAST=""
+          echo "cert-reloader started"
+          while true; do
+            if [ -f /certs/tls.crt ]; then
+              CUR=$(sha256sum /certs/tls.crt | awk '{print $1}')
+              if [ "$CUR" != "$LAST" ]; then
+                cat /certs/tls.key /certs/tls.crt > /tls/mongo.pem.tmp && chmod 644 /tls/mongo.pem.tmp && mv /tls/mongo.pem.tmp /tls/mongo.pem
+                # Rotate on every observed cert (first pass included); record LAST only after a
+                # successful rotate. A solo sidecar restart mid-rotation leaves mongod serving the
+                # OLD in-memory cert while /certs already holds the NEW one — the former "first pass
+                # just records, no rotate" shortcut adopted that as baseline and never healed mongod
+                # until a full pod restart. A failed rotate (mongod not ready yet) leaves LAST unset to retry.
+                if timeout 30 mongosh --quiet --host 127.0.0.1 --port 27017 --tls --tlsAllowInvalidCertificates -u "$MONGO_USER" -p "$MONGO_PASS" --authenticationDatabase admin --eval 'db.adminCommand({rotateCertificates:1})'; then
+                  LAST="$CUR"
+                  echo "$(date -u) cert (re)loaded -> PEM rebuilt + rotated online"
+                else
+                  echo "$(date -u) rotate failed (mongod not ready?); will retry"
+                fi
+              fi
+            fi
+            sleep 60
+          done
+        env:
+        - name: MONGO_USER
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-creds
+              key: username
+        - name: MONGO_PASS
+          valueFrom:
+            secretKeyRef:
+              name: mongodb-creds
+              key: password
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            # 512Mi is required: mongosh OOM-kills (exit 137) at 128Mi.
+            memory: 512Mi
+        volumeMounts:
+        - name: cert
+          mountPath: /certs
+          readOnly: true
+        - name: tls
+          mountPath: /tls
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: mongodb-data
+      - name: cert
+        secret:
+          secretName: mongo-tls
+          defaultMode: 0400  # octal → 256; private key readable by owner only
+      - name: tls
+        emptyDir: {}

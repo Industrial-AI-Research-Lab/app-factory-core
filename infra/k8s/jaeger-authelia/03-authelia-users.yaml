@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: authelia-users
+  namespace: ${NAMESPACE}
+data:
+  users_database.yml: |
+    users:
+      admin:
+        displayname: "Admin"
+        password: "${AUTHELIA_ADMIN_PASSWORD_HASH}"
+        email: "${AUTHELIA_ADMIN_EMAIL}"
+        groups:
+          - admins

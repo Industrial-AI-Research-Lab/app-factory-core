@@ -1,0 +1,76 @@
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "AppFactory.fullname" . }}
+  annotations:
+{{- if .Values.ingress.certManager.enabled }}
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.certManager.clusterIssuer | quote }}
+{{- end }}
+    # Align with FILE_UPLOAD_MAX_FILES * FILE_UPLOAD_MAX_BYTES (~250MiB) + MCP zip (100MiB).
+    # Was 1024m — left attachment multipart DoS room after auth.
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+{{- if .Values.ingress.spaFallback }}
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      try_files $uri /index.html;
+{{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  {{- if and .Values.ingress.tls.enabled (or .Values.ingress.hosts.web .Values.ingress.hosts.api) }}
+  tls:
+    - hosts:
+      {{- if .Values.ingress.hosts.web }}
+        - {{ .Values.ingress.hosts.web | quote }}
+      {{- end }}
+      {{- if .Values.ingress.hosts.api }}
+        - {{ .Values.ingress.hosts.api | quote }}
+      {{- end }}
+      secretName: {{ .Values.ingress.tls.secretName | quote }}
+  {{- end }}
+  rules:
+  {{- if .Values.ingress.hosts.web }}
+    - host: {{ .Values.ingress.hosts.web | quote }}
+      http:
+        paths:
+          # API paths must come first (more specific) to route to backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "AppFactory.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # SSE events endpoint
+          - path: /events
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "AppFactory.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+          # All other paths go to frontend SPA
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "AppFactory.fullname" . }}-frontend
+                port:
+                  number: {{ .Values.frontend.service.port }}
+  {{- end }}
+  {{- if and .Values.ingress.hosts.api (ne .Values.ingress.hosts.api .Values.ingress.hosts.web) }}
+    - host: {{ .Values.ingress.hosts.api | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "AppFactory.fullname" . }}-backend
+                port:
+                  number: {{ .Values.backend.service.port }}
+  {{- end }}
+{{- end }}

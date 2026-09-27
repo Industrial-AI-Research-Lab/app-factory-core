@@ -1,0 +1,199 @@
+name: AppFactory-local
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - "quit(db.runCommand({ ping: 1 }).ok ? 0 : 2)"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  backend:
+    image: AppFactory-backend:local
+    build:
+      context: ../..
+      dockerfile: deploy/AppFactory/backend.Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env
+    environment:
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-synaps}
+      MONGODB_ENABLE_TRANSACTIONS: "false"
+      CORS_ALLOW_ORIGINS: http://localhost:${FRONTEND_PORT:-5173}
+      CONTAINER_USE_ENABLED: ${CONTAINER_USE_ENABLED:-true}
+      CONTAINER_USE_CLI_PATH: cu
+      REPOSITORIES_ROOT: /work/repositories
+      DOCKER_HOST: unix:///var/run/docker.sock
+      ARCHIVE_S3_ENDPOINT: http://minio:9000
+      ARCHIVE_S3_REGION: ${ARCHIVE_S3_REGION:-us-east-1}
+      ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET:-AppFactory-archives}
+      ARCHIVE_S3_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      ARCHIVE_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      ARCHIVE_S3_ADDRESSING_STYLE: path
+      FILE_S3_BUCKET: ${FILE_S3_BUCKET:-AppFactory-files}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - container-repositories:/work/repositories
+      - backend-state:/var/lib/AppFactory
+    depends_on:
+      mongo:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  frontend:
+    image: AppFactory-frontend:local
+    build:
+      context: ../..
+      dockerfile: deploy/AppFactory/frontend.Dockerfile
+      args:
+        API_URL: /api
+        WEB_URL: http://localhost:${FRONTEND_PORT:-5173}
+        BUILD_ID: local
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_started
+
+  gateway:
+    image: nginx:${NGINX_VERSION:-1.27-alpine}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    configs:
+      - source: gateway-nginx
+        target: /etc/nginx/conf.d/default.conf
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+
+  minio:
+    image: quay.io/minio/minio:${MINIO_VERSION:-RELEASE.2025-04-22T22-12-26Z}
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_BIND:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${MINIO_BIND:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: quay.io/minio/mc:${MINIO_MC_VERSION:-RELEASE.2025-04-16T18-13-26Z}
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      ARCHIVE_S3_BUCKET: ${ARCHIVE_S3_BUCKET:-AppFactory-archives}
+      FILE_S3_BUCKET: ${FILE_S3_BUCKET:-AppFactory-files}
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        until mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD"; do sleep 2; done
+        mc mb --ignore-existing "local/$$ARCHIVE_S3_BUCKET"
+        mc mb --ignore-existing "local/$$FILE_S3_BUCKET"
+
+  loki:
+    image: grafana/loki:${LOKI_VERSION:-2.9.8}
+    restart: unless-stopped
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "${LOKI_BIND:-127.0.0.1}:${LOKI_PORT:-3100}:3100"
+    volumes:
+      - ../../infra/loki/config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:${PROMTAIL_VERSION:-2.9.8}
+    restart: unless-stopped
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      loki:
+        condition: service_started
+    volumes:
+      - ./promtail.yml:/etc/promtail/config.yml:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - promtail-positions:/run/promtail
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-11.2.0}
+    restart: unless-stopped
+    depends_on:
+      loki:
+        condition: service_started
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3000}
+    ports:
+      - "${GRAFANA_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ../observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+
+volumes:
+  mongo-data:
+  container-repositories:
+  backend-state:
+  minio-data:
+  loki-data:
+  promtail-positions:
+  grafana-data:
+
+configs:
+  gateway-nginx:
+    content: |
+      server {
+          listen 80;
+          server_name _;
+
+          location /api {
+              proxy_pass http://backend:8000;
+              proxy_http_version 1.1;
+              proxy_buffering off;
+              proxy_cache off;
+              proxy_read_timeout 3600s;
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+
+          location / {
+              proxy_pass http://frontend:80;
+              proxy_http_version 1.1;
+              proxy_set_header Host $$host;
+              proxy_set_header X-Real-IP $$remote_addr;
+              proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+              proxy_set_header X-Forwarded-Proto $$scheme;
+          }
+      }

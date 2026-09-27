@@ -1,0 +1,27 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jaeger
+  namespace: ${NAMESPACE}
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    # Authentication disabled - authelia-errors middleware doesn't work with Jaeger (returns plain 401 instead of redirect)
+    # TODO: Investigate why identical middleware config works for Bifrost but not Jaeger
+spec:
+  tls:
+    - hosts:
+        - ${JAEGER_DOMAIN}
+      secretName: AppFactory-tls
+  rules:
+    - host: ${JAEGER_DOMAIN}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jaeger
+                port:
+                  number: 16686

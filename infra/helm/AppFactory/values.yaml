@@ -1,0 +1,92 @@
+# Global image registry and pull secret
+imageRegistry: ""
+imageNamespace: AppFactory
+imagePullSecrets: [] # e.g. [{ name: registry-cred }]
+
+frontend:
+  image:
+    repository: frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 80
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: [] # list of { name: VITE_API_BASE, value: https://api.AppFactory.example.com }
+
+backend:
+  image:
+    repository: backend
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicaCount: 1
+  service:
+    type: ClusterIP
+    port: 8000
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  extraEnv: [] # list of { name: ..., value: ... } for non-secret envs, e.g. SEED_ENABLED=true in prod
+  extraEnvFromSecrets: # list of secret names to project as envFrom
+    - backend-secrets
+
+  # Configure git identity inside the backend pod at startup
+  gitConfig:
+    enabled: true
+    email: "ci@cu"
+    name: "CI"
+
+  containerUse:
+    enabled: true
+    cliPath: /usr/local/bin/cu
+    dockerHost: tcp://localhost:2375
+    installCu: false
+    cuInstallScriptUrl: https://raw.githubusercontent.com/dagger/container-use/main/install.sh
+    # Optional mirror and retry policy for idempotent installs
+    cuMirrorUrl: ""
+    installRetries: 5
+    installRetryDelaySeconds: 3
+
+  dind:
+    enabled: true
+    image: docker:24.0-dind
+    args:
+      - --host=tcp://0.0.0.0:2375
+      - --insecure-registry=docker-registry:5000
+      - --insecure-registry=registry.AppFactory.example.com
+    env:
+      DOCKER_TLS_CERTDIR: ""
+    privileged: true
+    resources: {}
+    storage:
+      type: emptyDir
+    # Kubernetes secret of type kubernetes.io/dockerconfigjson.
+    # Copied into a writable /root/.docker/config.json during pod startup so
+    # Docker CLI can authenticate and still update config atomically.
+    registrySecretName: ""
+
+ingress:
+  enabled: true
+  className: ""
+  tls:
+    enabled: true
+    secretName: AppFactory-tls
+  # cert-manager auto-renewal (recommended to prevent certificate expiry)
+  certManager:
+    enabled: true
+    clusterIssuer: letsencrypt-prod
+    # Use wildcard to cover all subdomains (registry, jaeger, llm, api, web)
+    # Set this to your base domain e.g. "AppFactory.example.com"
+    wildcardDomain: ""
+    # Or specify individual extra DNS names beyond hosts.web and hosts.api
+    extraDnsNames: []
+  hosts:
+    web: ""
+    api: ""
+  # When true, add an nginx configuration snippet to fallback SPA routes to index.html
+  spaFallback: true
